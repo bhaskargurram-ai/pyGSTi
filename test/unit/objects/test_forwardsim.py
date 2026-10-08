@@ -920,3 +920,95 @@ def test_torch_plan_scattered_output_rows_jacobian():
         for idx, outcome in zip(all_idx[inds], outcomes):
             assert abs(P[idx] - ref_P[c][outcome]) < 1e-12
             assert np.allclose(J[idx], ref_J[c][outcome], atol=1e-9)
+
+
+class MapForwardSimAnalyticJacobianTester(BaseCase):
+    """MapForwardSimulator's analytic (adjoint-pass) Jacobian agrees with MatrixForwardSimulator's
+    analytic Jacobian and with MapForwardSimulator's own finite-difference Jacobian (GitHub issue 918)."""
+
+    @staticmethod
+    def _noisy_model(pack, parameterization, seed):
+        model = pack.target_model(parameterization)
+        rng = np.random.default_rng(seed)
+        model.from_vector(model.to_vector() + 0.01 * rng.standard_normal(model.num_params))
+        return model
+
+    @staticmethod
+    def _jacobian(model, circuits, sim):
+        model = model.copy()
+        model.sim = sim
+        layout = model.sim.create_layout(circuits, array_types=('E', 'EP'))
+        jac = np.zeros((len(layout), model.num_params))
+        model.sim.bulk_fill_dprobs(jac, layout)
+        return jac, layout
+
+    def _check_against_references(self, model, circuits, fd_atol=1e-5):
+        from pygsti.forwardsims import mapforwardsim_calc_adjoint as adjoint
+        jac, layout = self._jacobian(model, circuits, MapForwardSimulator(analytic_derivs=True))
+        self.assertTrue(all(adjoint.supports_adjoint_dprobs(model, atom) for atom in layout.atoms))
+
+        ref, ref_layout = self._jacobian(model, circuits, MatrixForwardSimulator())
+        for c in circuits:
+            self.assertArraysAlmostEqual(jac[layout.indices(c)], ref[ref_layout.indices(c)], places=10)
+
+        fd, _ = self._jacobian(model, circuits, MapForwardSimulator())
+        np.testing.assert_allclose(jac, fd, rtol=1e-6, atol=fd_atol)
+        return jac
+
+    def test_full_tp_1q(self):
+        model = self._noisy_model(smq1Q_XYI, 'full TP', seed=918)
+        self._check_against_references(model, smq1Q_XYI.create_gst_experiment_design(2).all_circuits_needing_data)
+
+    def test_hs_1q(self):
+        model = self._noisy_model(smq1Q_XYI, 'H+S', seed=919)
+        self._check_against_references(model, smq1Q_XYI.create_gst_experiment_design(2).all_circuits_needing_data)
+
+    def test_cptplnd_1q(self):
+        model = self._noisy_model(smq1Q_XYI, 'CPTPLND', seed=920)
+        self._check_against_references(model, smq1Q_XYI.create_gst_experiment_design(2).all_circuits_needing_data)
+
+    def test_cptplnd_2q(self):
+        model = self._noisy_model(smq2Q_XYICNOT, 'CPTPLND', seed=921)
+        circuits = smq2Q_XYICNOT.create_gst_experiment_design(1).all_circuits_needing_data[:12]
+        self._check_against_references(model, circuits)
+
+    def test_multiple_preps_and_povms(self):
+        model = self._noisy_model(smq1Q_XYI, 'full TP', seed=922)
+        model.preps['rho1'] = model.operations[L('Gxpi2', 0)].to_dense() @ model.preps['rho0'].to_dense()
+        model.povms['M1'] = model.povms['Mdefault'].copy()
+        model.from_vector(model.to_vector() + 0.01 * np.random.default_rng(923).standard_normal(model.num_params))
+        circuits = [Circuit([L('rho1'), L('Gxpi2', 0), L('Gypi2', 0), L('Gxpi2', 0), L('M1')], line_labels=(0,)),
+                    Circuit([L('rho0'), L('Gypi2', 0), L('M1')], line_labels=(0,)),
+                    Circuit([L('rho1'), L('Gxpi2', 0), L('Mdefault')], line_labels=(0,)),
+                    Circuit([L('rho1'), L('Mdefault')], line_labels=(0,))]
+        self._check_against_references(model, circuits)
+
+    def test_param_blocks_match_unblocked(self):
+        model = self._noisy_model(smq1Q_XYI, 'CPTPLND', seed=924)
+        circuits = smq1Q_XYI.create_gst_experiment_design(1).all_circuits_needing_data
+        full, _ = self._jacobian(model, circuits, MapForwardSimulator(analytic_derivs=True))
+        blocked, _ = self._jacobian(model, circuits, MapForwardSimulator(param_blk_sizes=(7,), analytic_derivs=True))
+        self.assertArraysAlmostEqual(full, blocked, places=12)
+
+    def test_instruments_fall_back_to_finite_differences(self):
+        from pygsti.forwardsims import mapforwardsim_calc_adjoint as adjoint
+        model = _iz_instrument_model(TPInstrument, seed=925)
+        circuits = smq1Q_XYI.create_gst_experiment_design(1).all_circuits_needing_data[:10]
+        jac, layout = self._jacobian(model, circuits, MapForwardSimulator(analytic_derivs=True))
+        self.assertFalse(any(adjoint.supports_adjoint_dprobs(model, atom) for atom in layout.atoms))
+        fd, _ = self._jacobian(model, circuits, MapForwardSimulator())
+        self.assertArraysAlmostEqual(jac, fd)
+
+    def test_auto_selection(self):
+        model2q = smq2Q_XYICNOT.target_model('CPTPLND')
+        model2q.sim = MapForwardSimulator(analytic_derivs="auto")
+        layout = model2q.sim.create_layout(smq2Q_XYICNOT.prep_fiducials()[:3], array_types=('E', 'EP'))
+        self.assertTrue(all(model2q.sim._use_analytic_dprobs(atom) for atom in layout.atoms))
+        model2q.sim = MapForwardSimulator()  # finite differences remain the default
+        layout = model2q.sim.create_layout(smq2Q_XYICNOT.prep_fiducials()[:3], array_types=('E', 'EP'))
+        self.assertFalse(any(model2q.sim._use_analytic_dprobs(atom) for atom in layout.atoms))
+
+    def test_analytic_derivs_survive_copy_and_serialization(self):
+        sim = MapForwardSimulator(analytic_derivs=True)
+        self.assertIs(sim.copy().analytic_derivs, True)
+        self.assertIs(MapForwardSimulator._from_nice_serialization(sim._to_nice_serialization()).analytic_derivs, True)

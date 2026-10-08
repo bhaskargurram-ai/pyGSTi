@@ -19,6 +19,7 @@ from numpy import linalg as _nla
 from pygsti.forwardsims.distforwardsim import DistributableForwardSimulator as _DistributableForwardSimulator
 from pygsti.forwardsims.forwardsim import ForwardSimulator as _ForwardSimulator
 from pygsti.forwardsims.forwardsim import _bytes_for_array_types
+from pygsti.forwardsims import mapforwardsim_calc_adjoint as _adjoint
 from pygsti.layouts.maplayout import MapCOPALayout as _MapCOPALayout
 from pygsti.baseobjs.profiler import DummyProfiler as _DummyProfiler
 from pygsti.baseobjs.resourceallocation import ResourceAllocation as _ResourceAllocation
@@ -114,8 +115,10 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
 
     Interfaces with a model via its `circuit_layer_operator` method and applies the resulting
     operators in order to propagate states and finally compute outcome probabilities.  Derivatives
-    are computed using finite-differences, and the prefix tables construbed by :class:`MapCOPALayout`
-    layout object are used to avoid duplicating (some) computation.
+    are computed using finite-differences unless `analytic_derivs` requests the (experimental)
+    analytic first derivatives of :mod:`pygsti.forwardsims.mapforwardsim_calc_adjoint`.  The prefix
+    tables constructed by :class:`MapCOPALayout` layout object are used to avoid duplicating (some)
+    computation.
 
     Parameters
     ----------
@@ -148,6 +151,26 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
         this can be a 0-, 1- or 2-tuple of integers or `None` values.  A block size of `None`
         means that there should be no division into blocks, and that each block processor
         computes all of its parameter indices at once.
+
+    derivative_eps : float, optional
+        The finite-difference step size used for first derivatives when they cannot be
+        computed analytically.
+
+    hessian_eps : float, optional
+        The finite-difference step size used for second derivatives.
+
+    analytic_derivs : {False, True, "auto"}, optional
+        How first derivatives are computed (experimental).  `False` (the default) always uses
+        finite differences.  `True` computes them analytically, with one forward and one adjoint
+        sweep per circuit, whenever the model and layout support it (see
+        :func:`~pygsti.forwardsims.mapforwardsim_calc_adjoint.supports_adjoint_dprobs`) and by
+        finite differences otherwise.  `"auto"` behaves like `True` only when the analytic path is
+        expected to be faster: always for the pure-Python evotypes, and for two-qubit (dim 16)
+        models with compiled evotypes, whose large parameter counts make finite differences
+        expensive.  Note that an exact Jacobian is exactly zero with respect to Lindblad
+        "Cholesky" (stochastic-rate) parameters that are exactly zero, e.g. for a CPTPLND or H+S
+        model at its target point, so an optimizer started there cannot move them; start such
+        fits from a slightly perturbed model.
     """
 
     @classmethod
@@ -164,18 +187,21 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
         return super()._array_types_for_method(method_name)
 
     def __init__(self, model=None, max_cache_size=None, num_atoms=None, processor_grid=None, param_blk_sizes=None,
-                 derivative_eps=1e-7, hessian_eps=1e-5):
+                 derivative_eps=1e-7, hessian_eps=1e-5, analytic_derivs=False):
         #super().__init__(model, num_atoms, processor_grid, param_blk_sizes)
         _DistributableForwardSimulator.__init__(self, model, num_atoms, processor_grid, param_blk_sizes)
         self._max_cache_size = max_cache_size
         self.derivative_eps = derivative_eps  # for finite difference derivative calculations
         self.hessian_eps = hessian_eps
+        assert analytic_derivs in (False, True, "auto"), "`analytic_derivs` must be False, True or 'auto'"
+        self.analytic_derivs = analytic_derivs
 
     def _to_nice_serialization(self):
         state = super()._to_nice_serialization()
         state.update({'max_cache_size': self._max_cache_size,
                       'derivative_epsilon': self.derivative_eps,
                       'hessian_epsilon': self.hessian_eps,
+                      'analytic_derivs': self.analytic_derivs,
                       # (don't serialize parent model or processor distribution info)
                       })
         return state
@@ -185,7 +211,8 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
         #Note: resets processor-distribution information
         return cls(None, state['max_cache_size'],
                    derivative_eps=state.get('derivative_epsilon', 1e-7),
-                   hessian_eps=state.get('hessian_epsilon', 1e-5))
+                   hessian_eps=state.get('hessian_epsilon', 1e-5),
+                   analytic_derivs=state.get('analytic_derivs', False))
 
     def copy(self, keep_model_attached=True):
         """
@@ -197,7 +224,7 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
         """
         out = MapForwardSimulator(
             self.model, self._max_cache_size, self._num_atoms,
-            self._processor_grid, self._pblk_sizes
+            self._processor_grid, self._pblk_sizes, analytic_derivs=self.analytic_derivs
         )
         if not keep_model_attached:
             out.model = None  # type: ignore
@@ -378,8 +405,23 @@ class MapForwardSimulator(_DistributableForwardSimulator, SimpleMapForwardSimula
     def _bulk_fill_dprobs_atom(self, array_to_fill, dest_param_slice, layout_atom, param_slice, resource_alloc):
         # Note: *don't* set dest_indices arg = layout.element_slice, as this is already done by caller
         resource_alloc.check_can_allocate_memory(layout_atom.cache_size * self.model.dim * _slct.length(param_slice))
+        if self._use_analytic_dprobs(layout_atom):
+            _adjoint.mapfill_dprobs_atom(self, array_to_fill, slice(0, array_to_fill.shape[0]), dest_param_slice,
+                                         layout_atom, param_slice, resource_alloc)
+            return
         self.calclib.mapfill_dprobs_atom(self, array_to_fill, slice(0, array_to_fill.shape[0]), dest_param_slice,
                                          layout_atom, param_slice, resource_alloc, self.derivative_eps)
+
+    def _use_analytic_dprobs(self, layout_atom):
+        mode = getattr(self, 'analytic_derivs', False)
+        if mode is False or not _adjoint.supports_adjoint_dprobs(self.model, layout_atom):
+            return False
+        if mode == "auto":
+            # The adjoint sweep is (for now) pure Python, so against a compiled finite-difference
+            # kernel it only pays off once the parameter count is large.
+            pure_python = self.calclib is _importlib.import_module("pygsti.forwardsims.mapforwardsim_calc_generic")
+            return pure_python or self.model.dim >= 16
+        return True
 
     def _bulk_fill_hprobs_atom(self, array_to_fill, dest_param_slice1, dest_param_slice2, layout_atom,
                                param_slice1, param_slice2, resource_alloc):
