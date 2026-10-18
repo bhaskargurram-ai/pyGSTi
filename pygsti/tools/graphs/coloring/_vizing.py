@@ -14,7 +14,8 @@ edge coloring using at most deg+1 colors (Vizing's theorem) and runs in O(n*m)
 time (n = |vertices|, m = |edges|) — the standard worst-case time complexity
 for this constructive Vizing-chain/Misra-Gries implementation.
 
-Also includes an internal `_BipartiteEdgeColoring` helper subclass.
+Also includes an internal `_BipartiteEdgeColoring` helper subclass, which
+colors bipartite graphs with exactly deg colors using alternating paths.
 
 References:
     V. G. Vizing, "On an estimate of the chromatic class of a p-graph,"
@@ -25,6 +26,10 @@ References:
     J. Misra and D. Gries, "A constructive proof of Vizing's theorem,"
     Information Processing Letters, vol. 41, no. 3, pp. 131-133, 1992.
     https://doi.org/10.1016/0020-0190(92)90041-S
+
+    D. Konig, "Uber Graphen und ihre Anwendung auf Determinantentheorie und
+    Mengenlehre," Mathematische Annalen, vol. 77, pp. 453-465, 1916.
+    https://doi.org/10.1007/BF01456961
 """
 import numpy as np
 from typing import List, Dict, Set, Optional, Union
@@ -233,7 +238,9 @@ class _VizingFamilyEdgeColoring(_VizingChainState):
         for u, v in self._ordered_edges():
             if not self._try_direct(u, v):
                 self.color_edge_vizing_chain(u, v)
-        return self.color_patches
+        # A key exists for every one of the deg+1 colors up front; drop the ones that
+        # ended up unused so the coloring reports the number of colors it really needs.
+        return {c: e for c, e in self.color_patches.items() if e}
 
 
 class _MisraGriesEdgeColoring(_VizingFamilyEdgeColoring):
@@ -288,35 +295,50 @@ def vizing_edge_coloring(
 
 class _BipartiteEdgeColoring(_VizingFamilyEdgeColoring):
     """
-    Randomised (Delta+1)-edge coloring that always returns a complete, valid
-    coloring. Edges are processed in a random order (`_ordered_edges`); for
-    each edge, Case 1 (`_try_direct`) assigns a color missing at both
-    endpoints directly, else Case 2 falls back to a Vizing-chain step
-    (inherited).
+    Exact deg-edge coloring of a bipartite graph (Konig's line coloring
+    theorem: the chromatic index of a bipartite graph is its maximum degree).
 
-    On bipartite graphs the random ordering lets Case 1 fire often, so the
-    result frequently uses only deg colors (the bipartite optimum); every
-    simple graph is still guaranteed a valid coloring.
+    Edges are processed in a random order (`_ordered_edges`). For each edge
+    (u, v), pick a color `a` free at u and a color `b` free at v; both exist
+    because only deg colors are in play and (u, v) is still uncolored. If `a`
+    is also free at v, use it. Otherwise swap colors a and b along the a/b
+    alternating path that starts at v. In a bipartite graph that path cannot
+    reach u (it would have to end at u on an `a` edge, but `a` is free at u),
+    so after the swap `a` is free at both endpoints. This never needs a
+    Vizing-chain step, and the result always uses exactly deg colors (for a
+    graph with at least one edge).
 
-    Case 1 here is the same fast path as `_VizingEdgeColoring._try_direct`
-    (just via set-intersection instead of a scan) -- this class differs from
-    `_VizingEdgeColoring` only in `_ordered_edges` (randomized vs. identity).
+    Not valid for non-bipartite graphs; `auto_edge_coloring` only uses it
+    after checking bipartiteness.
     """
 
     def __init__(self, deg: int, edges: List[Edge], neighbors: NeighborMap,
                  seed: Optional[Union[int, np.random.Generator]] = None) -> None:
         super().__init__(deg, edges, neighbors)
         self.rng = np.random.default_rng(seed)
+        self.all_colors = list(range(deg))
+        self.color_patches = {c: [] for c in self.all_colors}
 
     def _ordered_edges(self) -> List[Edge]:
         return [self.unique_edges[i] for i in self.rng.permutation(len(self.unique_edges))]
 
     def _try_direct(self, u: Vertex, v: Vertex) -> bool:
-        common = self.missing_colors(u) & self.missing_colors(v)
+        free_u = self.missing_colors(u)
+        free_v = self.missing_colors(v)
+        if not free_u or not free_v:
+            raise RuntimeError("no free color available; the graph's maximum degree exceeds deg")
+        common = free_u & free_v
         if common:
-            self.set_edge_color(u, v, next(iter(common)))
+            self.set_edge_color(u, v, min(common))
             return True
-        return False
-
-
-
+        a = min(free_u)
+        b = min(free_v)
+        # `a` is used at v and `b` is free there, so the path starting at v begins with an `a` edge.
+        path = self.cd_path(v, b, a)
+        new_colors = [b if self.edge_colors[e] == a else a for e in path]
+        for (x, y), c in zip(path, new_colors):
+            self.set_edge_color(x, y, c)
+        if not (self.is_free(a, u) and self.is_free(a, v)):
+            raise RuntimeError("alternating path reached both endpoints; the graph is not bipartite")
+        self.set_edge_color(u, v, a)
+        return True

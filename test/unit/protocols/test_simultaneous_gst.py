@@ -732,6 +732,58 @@ class HelperRejectsMalformedInputTester(_SGSTFixture, BaseCase):
         self.assertIn("not one of this patch's own edges", str(ctx.exception))
 
 
+def _grid_pspec(rows, cols):
+    """A rows x cols grid processor spec built from an explicit availability.
+
+    Rectangular grids are not one of the canonical ``geometry`` topologies, so the
+    'auto' coloring treats them as a generic bipartite graph.
+    """
+    qubits = tuple(range(rows * cols))
+    edges = [(r * cols + c, r * cols + c + 1) for r in range(rows) for c in range(cols - 1)]
+    edges += [(r * cols + c, (r + 1) * cols + c) for r in range(rows - 1) for c in range(cols)]
+    oneq_locations = [(q,) for q in qubits]
+    availability = {
+        'Gi': oneq_locations,
+        'Gxpi2': oneq_locations,
+        'Gypi2': oneq_locations,
+        'Gcnot': edges,
+        'Gii': edges,
+    }
+    return QubitProcessorSpec(
+        len(qubits), gate_names=['Gi', 'Gxpi2', 'Gypi2', 'Gcnot', 'Gii'],
+        nonstd_gate_unitaries={'Gii': np.eye(4)},
+        availability=availability, qubit_labels=qubits,
+    )
+
+
+class EmptyPatchTester(BaseCase):
+    """An empty color patch costs a full patch of 1Q-only circuits, so none may survive (#938)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.oneq, cls.twoq = _make_designs()
+
+    def test_rectangular_grid_gets_deg_patches_for_every_seed(self):
+        pspec = _grid_pspec(2, 3)  # max degree 3
+        for seed in range(4):
+            design = make_simultaneous_gst_design(pspec, self.oneq, self.twoq, seed=seed)
+            self.assertEqual(len(design.color_patches), 3, msg=f"seed={seed}: {design.color_patches}")
+            self.assertTrue(all(design.color_patches.values()), msg=f"seed={seed}: {design.color_patches}")
+
+    def test_empty_patch_in_a_supplied_coloring_is_dropped(self):
+        pspec, _qubits, _edges = _line_pspec(3)
+        coloring = {0: [(0, 1)], 1: [], 2: [(1, 2)]}
+        with self.assertWarns(UserWarning) as ctx:
+            design = SimultaneousGSTDesign(pspec, self.oneq, self.twoq, coloring, seed=0)
+        self.assertIn("empty color patches [1]", str(ctx.warning))
+        self.assertEqual(design.color_patches, {0: [(0, 1)], 2: [(1, 2)]})
+
+        reference = SimultaneousGSTDesign(pspec, self.oneq, self.twoq, {0: [(0, 1)], 2: [(1, 2)]}, seed=0)
+        self.assertEqual([list(cl) for cl in design.circuit_lists],
+                         [list(cl) for cl in reference.circuit_lists])
+
+
 class EdgeNormalizationTester(_SGSTFixture, BaseCase):
     """
     Cover ``_normalize_coloring`` and the invariant it establishes: an edge in

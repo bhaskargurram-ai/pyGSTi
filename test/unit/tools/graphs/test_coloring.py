@@ -605,6 +605,45 @@ class AutoEdgeColoringOptimalityTester(BaseCase):
         self.assertEqual(_canonical_coloring(r1), _canonical_coloring(r2))
 
 
+    def test_rectangular_grid_uses_exactly_deg_colors(self):
+        # An r x c grid with r != c is not a canonical topology, so 'auto' sends it to the
+        # bipartite branch, which must still find a deg-coloring for every seed (#938).
+        for rows, cols in ((2, 3), (3, 2), (2, 5), (3, 4), (4, 6)):
+            vertices, edges, neighbors, deg = make_grid_graph(rows, cols)
+            self.assertEqual(detect_topology(vertices, edges, neighbors), "unknown")
+            for seed in range(10):
+                cp = switchboard_find_edge_coloring("auto", deg, vertices, edges, neighbors, seed=seed)
+                proper, complete, ncolors = assess_coloring(cp, edges)
+                self.assertTrue(proper and complete, f"grid {rows}x{cols} seed={seed}: invalid coloring")
+                self.assertEqual(ncolors, deg, f"grid {rows}x{cols} seed={seed}: {ncolors} colors, expected {deg}")
+
+    def test_random_bipartite_graphs_use_exactly_deg_colors(self):
+        rng = np.random.default_rng(938)
+        for trial in range(25):
+            n_left, n_right = rng.integers(2, 9, size=2)
+            left = list(range(n_left))
+            right = list(range(n_left, n_left + n_right))
+            edges = [(u, v) for u in left for v in right if rng.random() < 0.5]
+            if not edges:
+                continue
+            vertices, edges, neighbors, deg = _finalize(left + right, edges)
+            cp = switchboard_find_edge_coloring("auto", deg, vertices, edges, neighbors, seed=trial)
+            proper, complete, ncolors = assess_coloring(cp, edges)
+            self.assertTrue(proper and complete, f"trial {trial}: invalid coloring")
+            self.assertEqual(ncolors, deg, f"trial {trial}: {ncolors} colors, expected {deg}")
+
+    def test_no_empty_color_classes(self):
+        # The Vizing family starts with a key for each of the deg+1 colors; unused
+        # ones must not be returned, since every color class becomes a patch (#938).
+        graphs = [make_grid_graph(2, 3), make_grid_graph(3, 4), make_high_degree_graph(),
+                  make_tee_graph(), make_complete_graph(6)]
+        for vertices, edges, neighbors, deg in graphs:
+            for algorithm in ("vizing", "misra_gries", "auto"):
+                cp = switchboard_find_edge_coloring(algorithm, deg, vertices, edges, neighbors, seed=0)
+                empty = [c for c, patch in cp.items() if not patch]
+                self.assertEqual(empty, [], f"{algorithm} returned empty color classes {empty}")
+
+
 class CheckValidEdgeColoringTester(BaseCase):
     """`check_valid_edge_coloring`'s accept/reject behavior and its error message."""
 

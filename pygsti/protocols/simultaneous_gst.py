@@ -59,8 +59,8 @@ def make_simultaneous_gst_design(
     Note that the coloring stream is frequently unused: "auto" detects the canonical
     topologies produced by ``ProcessorSpec(geometry=...)`` (line/ring/grid/torus) and
     coloring those is a deterministic closed form using the optimal number of colors.
-    The seed reaches the coloring only on the randomized bipartite path; the generic
-    (deg+1)-color fallback is deterministic too.
+    The seed reaches the coloring only on the randomized bipartite path (which always
+    uses exactly deg colors); the generic (deg+1)-color fallback is deterministic too.
 
     ``verbosity`` is forwarded to the design's circuit stitcher; anything greater
     than 0 displays a progress bar over germ powers while stitching.
@@ -195,6 +195,14 @@ class SimultaneousGSTDesign(GateSetTomographyDesign):
         self.neighbors = find_neighbors(self.vertices, self.edges)
         self.deg = max([len(self.neighbors[v]) for v in self.vertices])
         self.color_patches = _normalize_coloring(edge_coloring)
+        empty_patches = [patch for patch, edge_set in self.color_patches.items() if not edge_set]
+        if empty_patches:
+            # An empty patch would add a full patch of circuits that only run 1Q GST on
+            # qubits every other patch already covers.
+            _warnings.warn(f"Dropping empty color patches {empty_patches} from edge_coloring; "
+                           "they add circuits without adding coverage.")
+            self.color_patches = {patch: edge_set for patch, edge_set in self.color_patches.items()
+                                  if edge_set}
         if circuit_stitcher is None:
             circuit_stitcher = RandomizedPatchStitcher()
         if not isinstance(circuit_stitcher, CircuitStitcher):

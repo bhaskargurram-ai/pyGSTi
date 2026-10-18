@@ -203,8 +203,8 @@ def auto_edge_coloring(deg: int, vertices: List[Vertex], edges: List[Edge],
     number of colors (the true chromatic index) for that topology.
 
     If not, it checks whether the graph is bipartite; if so, it uses an internal
-    bipartite-optimal randomized coloring (using `seed`) that frequently achieves
-    the optimal `deg` colors in practice.
+    randomized (using `seed`) alternating-path coloring that always uses exactly
+    `deg` colors, the optimum for a bipartite graph.
 
     Otherwise, it falls back to `vizing_edge_coloring` -- a deterministic algorithm that is
     always valid and complete, using at most deg+1 colors -- for graphs that
